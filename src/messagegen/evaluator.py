@@ -8,7 +8,7 @@ from typing import Any, List
 from .constraints import check_deterministic
 from .llm import GroqConnectionError, GroqGenerator
 from .models import ConstraintResult, Evaluation, MessageInstance
-from .utils import normalize, word_count
+from .utils import contains_concept, normalize, word_count
 
 
 OPEN_CONSTRAINTS = ("saludo", "cuerpo", "cierre", "cierre_agradecimiento")
@@ -159,75 +159,22 @@ class GroqOpenConstraintJudge:
 class HeuristicOpenConstraintJudge:
     """Respaldo local aproximado para pruebas sin Groq.
 
-    Este modo no intenta enumerar saludos ni agradecimientos; para resultados
-    finales debe usarse `open_constraint_evaluator=llm`.
+    Este modo no evalúa saludo, cuerpo, cierre ni agradecimiento, porque son
+    restricciones abiertas. Para resultados finales debe usarse
+    `open_constraint_evaluator=llm`.
     """
 
     def evaluate(self, text: str, instance: MessageInstance) -> list[ConstraintResult]:
-        segments = _split_segments(text)
-        required = set(instance.required_structure)
-        results: list[ConstraintResult] = []
-
-        if "saludo" in required:
-            first_words = word_count(segments[0]) if segments else 0
-            ok = bool(segments) and len(segments) >= 2 and first_words <= 12
-            results.append(
-                ConstraintResult(
-                    "saludo",
-                    ok,
-                    "primer segmento breve y separado" if ok else "no hay apertura breve separada",
-                    "heuristic_open_constraints",
-                    [] if ok else ["saludo"],
-                )
+        _ = text, instance
+        return [
+            ConstraintResult(
+                name=name,
+                passed=True,
+                details="no evaluado en modo heurístico; requiere juez LLM",
+                source="heuristic_open_constraints",
             )
-        else:
-            results.append(ConstraintResult("saludo", True, "no requerido", "heuristic_open_constraints"))
-
-        if "cuerpo" in required:
-            ok = word_count(text) >= max(12, instance.min_words // 2) and len(segments) >= 2
-            results.append(
-                ConstraintResult(
-                    "cuerpo",
-                    ok,
-                    "hay desarrollo central suficiente" if ok else "desarrollo central insuficiente",
-                    "heuristic_open_constraints",
-                    [] if ok else ["cuerpo"],
-                )
-            )
-        else:
-            results.append(ConstraintResult("cuerpo", True, "no requerido", "heuristic_open_constraints"))
-
-        if "cierre" in required:
-            last_words = word_count(segments[-1]) if segments else 0
-            ok = len(segments) >= 2 and 1 <= last_words <= 18
-            results.append(
-                ConstraintResult(
-                    "cierre",
-                    ok,
-                    "último segmento breve" if ok else "no hay cierre breve separado",
-                    "heuristic_open_constraints",
-                    [] if ok else ["cierre"],
-                )
-            )
-        else:
-            results.append(ConstraintResult("cierre", True, "no requerido", "heuristic_open_constraints"))
-
-        if instance.must_end_with_gratitude:
-            results.append(
-                ConstraintResult(
-                    "cierre_agradecimiento",
-                    False,
-                    "requiere juez LLM; no se valida con listas cerradas en modo heurístico",
-                    "heuristic_open_constraints",
-                    ["cierre_agradecimiento"],
-                )
-            )
-        else:
-            results.append(
-                ConstraintResult("cierre_agradecimiento", True, "no requerido", "heuristic_open_constraints")
-            )
-
-        return results
+            for name in OPEN_CONSTRAINTS
+        ]
 
 
 class GroqSemanticJudge:
@@ -342,9 +289,51 @@ class MessageEvaluator:
     def evaluate(self, text: str, instance: MessageInstance) -> Evaluation:
         constraint_start = time.perf_counter()
         constraint_results = check_deterministic(text, instance)
+        if any(not result.passed for result in constraint_results):
+            constraint_eval_time_ms = (time.perf_counter() - constraint_start) * 1000
+            hard_score = sum(r.passed for r in constraint_results) / len(constraint_results)
+            semantic_score, notes = self._objective_failure_score(text, instance)
+            total_score = 0.70 * hard_score + 0.30 * semantic_score
+            return Evaluation(
+                hard_score=round(hard_score, 4),
+                semantic_score=round(semantic_score, 4),
+                total_score=round(total_score, 4),
+                valid=False,
+                constraint_results=constraint_results,
+                open_constraint_evaluator=self.open_constraint_evaluator,
+                semantic_evaluator=self.semantic_evaluator,
+                constraint_eval_time_ms=round(constraint_eval_time_ms, 3),
+                semantic_eval_time_ms=0.0,
+                notes=[
+                    f"evaluador_restricciones_abiertas={self.open_constraint_evaluator}",
+                    "evaluacion_llm_omitida=fallo_objetivo",
+                    *notes,
+                ],
+            )
+
         open_results = self._open_judge.evaluate(text, instance)
         constraint_results.extend(open_results)
         constraint_eval_time_ms = (time.perf_counter() - constraint_start) * 1000
+        if any(not result.passed for result in constraint_results):
+            hard_score = sum(r.passed for r in constraint_results) / len(constraint_results)
+            semantic_score, notes = self._objective_failure_score(text, instance)
+            total_score = 0.70 * hard_score + 0.30 * semantic_score
+            return Evaluation(
+                hard_score=round(hard_score, 4),
+                semantic_score=round(semantic_score, 4),
+                total_score=round(total_score, 4),
+                valid=False,
+                constraint_results=constraint_results,
+                open_constraint_evaluator=self.open_constraint_evaluator,
+                semantic_evaluator=self.semantic_evaluator,
+                constraint_eval_time_ms=round(constraint_eval_time_ms, 3),
+                semantic_eval_time_ms=0.0,
+                notes=[
+                    f"evaluador_restricciones_abiertas={self.open_constraint_evaluator}",
+                    "evaluacion_llm_semantica_omitida=fallo_restriccion_abierta",
+                    *notes,
+                ],
+            )
 
         semantic_start = time.perf_counter()
         semantic_score, notes = self.semantic_score(text, instance)
@@ -366,6 +355,31 @@ class MessageEvaluator:
             semantic_eval_time_ms=round(semantic_eval_time_ms, 3),
             notes=notes,
         )
+
+    @staticmethod
+    def _objective_failure_score(text: str, instance: MessageInstance) -> tuple[float, List[str]]:
+        wc = word_count(text)
+        if wc < instance.min_words:
+            distance = instance.min_words - wc
+        elif wc > instance.max_words:
+            distance = wc - instance.max_words
+        else:
+            distance = 0
+
+        span = max(1, instance.max_words - instance.min_words)
+        length_fit = max(0.0, 1.0 - distance / span)
+        concept_fit = (
+            1.0
+            if not instance.required_concepts
+            else sum(contains_concept(text, concept) for concept in instance.required_concepts)
+            / len(instance.required_concepts)
+        )
+        score = 0.75 * length_fit + 0.25 * concept_fit
+        return max(0.0, min(1.0, score)), [
+            "evaluador_semantico=proxy_objetivo",
+            f"ajuste_longitud={length_fit:.2f}",
+            f"ajuste_conceptos={concept_fit:.2f}",
+        ]
 
     def semantic_score(self, text: str, instance: MessageInstance) -> tuple[float, List[str]]:
         if self.semantic_evaluator == "llm":

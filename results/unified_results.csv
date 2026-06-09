@@ -1,0 +1,1 @@
+instance_id,strategy,difficulty,prompt_version,query,instance_json,open_constraint_evaluator,semantic_evaluator,valid,hard_score,semantic_score,total_score,violations,attempts,attempt_trace,failed_constraints,invalid_reason,error_type,error_message,evaluation_notes,generation_time_ms,constraint_eval_time_ms,semantic_eval_time_ms,total_time_ms,time_ms,message

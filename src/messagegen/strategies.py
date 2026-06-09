@@ -61,13 +61,43 @@ def _is_better(candidate: Candidate, best: Candidate | None) -> bool:
     return cand_ev.total_score > best_ev.total_score
 
 
-def _feedback(results: list[ConstraintResult]) -> list[str]:
+def _feedback(
+    results: list[ConstraintResult],
+    text: str | None = None,
+    instance: MessageInstance | None = None,
+) -> list[str]:
     feedback: list[str] = []
     for result in results:
         if result.passed:
             continue
         missing = f"; faltante={', '.join(result.missing)}" if result.missing else ""
-        feedback.append(f"{result.name}: {result.details}{missing}")
+        instruction = ""
+        if result.name == "longitud" and text is not None and instance is not None:
+            n = word_count(text)
+            span = instance.max_words - instance.min_words
+            target = max(instance.min_words, min(instance.max_words - 1, instance.min_words + round(span * 0.75)))
+            if n < instance.min_words:
+                needed = max(instance.min_words - n, target - n)
+                instruction = (
+                    f"; acción=reescribe completo, agrega alrededor de {needed} palabras netas "
+                    f"y apunta a {target}; no hagas un parche mínimo"
+                )
+            elif n > instance.max_words:
+                instruction = (
+                    f"; acción=reescribe compacto, elimina al menos {n - instance.max_words} palabras "
+                    f"y apunta a {target}; no agregues ideas nuevas"
+                )
+        elif result.name == "conceptos_obligatorios" and result.missing:
+            instruction = (
+                "; acción=inserta literalmente estas palabras exactas: "
+                + ", ".join(f"'{item}'" for item in result.missing)
+            )
+        elif result.name == "terminos_prohibidos" and result.missing:
+            instruction = (
+                "; acción=elimina por completo estas palabras: "
+                + ", ".join(f"'{item}'" for item in result.missing)
+            )
+        feedback.append(f"{result.name}: {result.details}{missing}{instruction}")
     return feedback
 
 
@@ -166,7 +196,10 @@ class RepairStrategy:
         best = current
 
         while attempts < self.max_attempts and current.evaluation is not None and not current.evaluation.valid:
-            feedback = _feedback(current.evaluation.constraint_results)
+            feedback = _feedback(current.evaluation.constraint_results, current.text, instance)
+            feedback.append(
+                f"reparacion_numero={attempts}; devuelve una versión nueva y no repitas una reparación inválida anterior"
+            )
             start = time.perf_counter()
             repaired_text = self.generator.repair(current.text, instance, feedback)
             timing["generation_time_ms"] += (time.perf_counter() - start) * 1000
@@ -217,7 +250,11 @@ class MultiCandidateStrategy:
         assert best is not None
         current = best
         while attempts_used < self.max_attempts and current.evaluation is not None and not current.evaluation.valid:
-            feedback = _feedback(current.evaluation.constraint_results)
+            feedback = _feedback(current.evaluation.constraint_results, current.text, instance)
+            feedback.append(
+                f"reparacion_numero={attempts_used - self.population_size + 1}; "
+                "devuelve una versión nueva y no repitas una reparación inválida anterior"
+            )
             start = time.perf_counter()
             repaired_text = self.generator.repair(current.text, instance, feedback)
             timing["generation_time_ms"] += (time.perf_counter() - start) * 1000
@@ -232,6 +269,76 @@ class MultiCandidateStrategy:
             if evaluation.valid:
                 timing["total_time_ms"] = (time.perf_counter() - total_start) * 1000
                 return _candidate(current.text, evaluation, attempts=attempts_used, timing=timing, attempt_trace=trace)
+            current = best
+
+        timing["total_time_ms"] = (time.perf_counter() - total_start) * 1000
+        return _candidate(best.text, best.evaluation, attempts=attempts_used, timing=timing, attempt_trace=trace)  # type: ignore[arg-type]
+
+
+@dataclass
+class UnifiedStrategy:
+    generator: BaseGenerator
+    evaluator: MessageEvaluator
+    max_repairs: int = 3
+    population_size: int = 3
+    name: str = "unified"
+
+    def run(self, instance: MessageInstance) -> Candidate:
+        total_start = time.perf_counter()
+        timing = _empty_timing()
+        trace: list[dict[str, object]] = []
+        best: Candidate | None = None
+        attempts_used = 0
+
+        population_size = max(1, self.population_size)
+        max_repairs = max(0, self.max_repairs)
+
+        for attempt in range(1, population_size + 1):
+            attempts_used += 1
+            start = time.perf_counter()
+            text = self.generator.generate(instance, attempt=attempt)
+            timing["generation_time_ms"] += (time.perf_counter() - start) * 1000
+
+            evaluation = self.evaluator.evaluate(text, instance)
+            _add_evaluation_timing(timing, evaluation)
+            trace.append(_trace_entry("candidate", attempts_used, text, evaluation))
+            cand = _candidate(text, evaluation, attempts=attempts_used, timing=timing, attempt_trace=trace)
+            if _is_better(cand, best):
+                best = cand
+
+        assert best is not None
+        if best.evaluation is not None and best.evaluation.valid:
+            timing["total_time_ms"] = (time.perf_counter() - total_start) * 1000
+            return _candidate(best.text, best.evaluation, attempts=attempts_used, timing=timing, attempt_trace=trace)
+
+        current = best
+        repairs_used = 0
+        while (
+            repairs_used < max_repairs
+            and current.evaluation is not None
+            and not current.evaluation.valid
+        ):
+            feedback = _feedback(current.evaluation.constraint_results, current.text, instance)
+            feedback.append(
+                f"reparacion_numero={repairs_used + 1}; "
+                "devuelve una versión nueva y no repitas una reparación inválida anterior"
+            )
+            start = time.perf_counter()
+            repaired_text = self.generator.repair(current.text, instance, feedback)
+            timing["generation_time_ms"] += (time.perf_counter() - start) * 1000
+            attempts_used += 1
+            repairs_used += 1
+
+            evaluation = self.evaluator.evaluate(repaired_text, instance)
+            _add_evaluation_timing(timing, evaluation)
+            trace.append(_trace_entry("repair_best", attempts_used, repaired_text, evaluation))
+            current = _candidate(repaired_text, evaluation, attempts=attempts_used, timing=timing, attempt_trace=trace)
+            if _is_better(current, best):
+                best = current
+            if evaluation.valid:
+                timing["total_time_ms"] = (time.perf_counter() - total_start) * 1000
+                return _candidate(current.text, evaluation, attempts=attempts_used, timing=timing, attempt_trace=trace)
+            current = best
 
         timing["total_time_ms"] = (time.perf_counter() - total_start) * 1000
         return _candidate(best.text, best.evaluation, attempts=attempts_used, timing=timing, attempt_trace=trace)  # type: ignore[arg-type]
@@ -252,4 +359,6 @@ def build_strategy(
         return RepairStrategy(generator, evaluator, max_attempts=max_attempts)
     if name == "multi":
         return MultiCandidateStrategy(generator, evaluator, max_attempts=max_attempts, population_size=population_size)
+    if name == "unified":
+        return UnifiedStrategy(generator, evaluator, max_repairs=max_attempts, population_size=population_size)
     raise ValueError(f"Estrategia desconocida: {name}")

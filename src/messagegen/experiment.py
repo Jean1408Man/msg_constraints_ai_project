@@ -12,7 +12,7 @@ from .models import ConstraintResult, Evaluation, ExperimentRow, MessageInstance
 from .strategies import build_strategy
 
 
-DEFAULT_STRATEGIES = ["direct", "repair", "multi"]
+DEFAULT_STRATEGIES = ["unified"]
 
 
 def _stable_offset(value: str) -> int:

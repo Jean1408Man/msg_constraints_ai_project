@@ -191,7 +191,10 @@ def add_generator_args(parser: argparse.ArgumentParser) -> None:
         "--open-constraint-evaluator",
         choices=["heuristic", "llm"],
         default="llm",
-        help="llm = Groq juzga saludo/cuerpo/cierre/agradecimiento; heuristic = respaldo local aproximado",
+        help=(
+            "llm = Groq juzga saludo/cuerpo/cierre/agradecimiento; "
+            "heuristic = no evalúa esas restricciones abiertas, solo sirve para pruebas locales"
+        ),
     )
 
 
@@ -210,11 +213,18 @@ def build_parser() -> argparse.ArgumentParser:
     add_generator_args(p0)
     p0.set_defaults(func=cmd_check_llm)
 
+    strategy_choices = ["unified", "direct", "verify", "repair", "multi"]
+
     p2 = sub.add_parser("generate-one", help="Genera y evalúa una instancia")
-    p2.add_argument("--strategy", choices=["direct", "verify", "repair", "multi"], default="repair")
+    p2.add_argument("--strategy", choices=strategy_choices, default="unified")
     p2.add_argument("--seed", type=int, default=42)
-    p2.add_argument("--max-attempts", type=int, default=3, help="Intentos máximos para repair; presupuesto total en multi")
-    p2.add_argument("--population-size", type=int, default=2, help="Candidatos iniciales para multi")
+    p2.add_argument(
+        "--max-attempts",
+        type=int,
+        default=3,
+        help="Reparaciones máximas para unified; intentos máximos para estrategias heredadas",
+    )
+    p2.add_argument("--population-size", type=int, default=3, help="Candidatos iniciales para unified/multi")
     add_generator_args(p2)
     p2.set_defaults(func=cmd_generate_one)
 
@@ -223,16 +233,21 @@ def build_parser() -> argparse.ArgumentParser:
     p3.add_argument("--out", default="results/experiment_results.csv")
     p3.add_argument("--n", type=int, default=50, help="Tamaño si hay que crear dataset")
     p3.add_argument("--seed", type=int, default=42)
-    p3.add_argument("--max-attempts", type=int, default=3, help="Intentos máximos para repair; presupuesto total en multi")
-    p3.add_argument("--population-size", type=int, default=2, help="Candidatos iniciales para multi")
+    p3.add_argument(
+        "--max-attempts",
+        type=int,
+        default=3,
+        help="Reparaciones máximas para unified; intentos máximos para estrategias heredadas",
+    )
+    p3.add_argument("--population-size", type=int, default=3, help="Candidatos iniciales para unified/multi")
     p3.add_argument("--resume", action="store_true", help="No repite pares instance_id + strategy ya escritos en el CSV")
     p3.add_argument("--no-progress", action="store_true", help="Desactiva la salida de progreso durante el experimento")
     p3.add_argument(
         "--strategies",
         nargs="+",
-        choices=["direct", "verify", "repair", "multi"],
+        choices=strategy_choices,
         default=None,
-        help="Estrategias a comparar; si se omite usa direct, repair y multi",
+        help="Estrategias a ejecutar; si se omite usa solo unified",
     )
     add_generator_args(p3)
     p3.set_defaults(func=cmd_run_experiment)

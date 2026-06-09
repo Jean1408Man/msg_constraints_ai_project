@@ -33,7 +33,7 @@ Crea un archivo `.env` en la raiz del proyecto:
 
 ```bash
 GROQ_API_KEY=tu_api_key_de_groq
-GROQ_MODEL=llama-3.3-70b-versatile
+GROQ_MODEL=llama-3.1-8b-instant
 ```
 
 El archivo `.env` queda ignorado por git. Tambien puedes exportar esas variables en la terminal si no quieres usar `.env`.
@@ -50,7 +50,7 @@ Debe aparecer un mensaje indicando que Groq respondio.
 
 ```bash
 PYTHONPATH=src python3 -m messagegen.cli generate-one \
-  --strategy repair \
+  --strategy unified \
   --open-constraint-evaluator llm \
   --semantic-evaluator llm
 ```
@@ -58,7 +58,7 @@ PYTHONPATH=src python3 -m messagegen.cli generate-one \
 Para probar otro modelo sin editar `.env`:
 
 ```bash
-PYTHONPATH=src python3 -m messagegen.cli generate-one --model otro-modelo --strategy repair
+PYTHONPATH=src python3 -m messagegen.cli generate-one --model otro-modelo --strategy unified
 ```
 
 ## Crear dataset simulado
@@ -81,9 +81,8 @@ PYTHONPATH=src python3 -m messagegen.cli run-experiment \
   --model llama-3.1-8b-instant \
   --open-constraint-evaluator llm \
   --semantic-evaluator llm \
-  --strategies direct repair multi \
   --max-attempts 3 \
-  --population-size 2 \
+  --population-size 3 \
   --resume
 ```
 
@@ -99,7 +98,7 @@ python3 scripts/analyze_results.py \
 
 Durante `run-experiment`, la CLI muestra progreso por cada combinacion `instancia + estrategia`: fila actual, barra de avance, validez, violaciones, intentos y tiempo. Si necesitas una salida silenciosa para scripts, agrega `--no-progress`.
 
-En `multi`, `--population-size` controla cuantos candidatos iniciales se generan. Si el mejor candidato sigue siendo invalido y `--max-attempts` deja presupuesto, la estrategia repara ese mejor candidato antes de devolverlo.
+La estrategia por defecto es `unified`. Primero genera varios candidatos (`--population-size`), selecciona el mejor por la funcion objetivo y, si todavia no es valido, lo repara hasta `--max-attempts` veces antes de devolver el mejor resultado encontrado.
 
 El CSV guarda trazabilidad para depuracion:
 
@@ -117,10 +116,11 @@ Si cambia `prompt_version`, `--resume` no reutiliza filas antiguas, para evitar 
 
 ## Estrategias disponibles
 
+- `unified`: genera varios candidatos, selecciona el mejor y repara ese candidato hasta cumplir o agotar el tope configurable.
 - `direct`: genera un solo mensaje y lo evalua.
 - `verify`: genera varios intentos y se detiene cuando encuentra uno valido.
 - `repair`: genera, verifica y repara usando retroalimentacion del verificador.
-- `multi`: genera varios candidatos y selecciona el mejor por funcion objetivo.
+- `multi`: genera varios candidatos y selecciona el mejor por funcion objetivo; se conserva como estrategia heredada.
 
 ## Archivos principales
 
@@ -138,4 +138,4 @@ scripts/analyze_results.py      Analisis agregado de resultados
 
 ## Descripcion para el informe
 
-> El sistema usa un LLM mediante la API de Groq como componente generativo, reparador, juez de restricciones abiertas y evaluador semantico. El codigo determinista comprueba longitud, conceptos obligatorios y terminos prohibidos. Groq evalua como restricciones duras los aspectos linguisticos abiertos: saludo, cuerpo, cierre y agradecimiento final. Si el mensaje falla, la estrategia de reparacion envia al LLM la retroalimentacion estructurada del verificador. Finalmente, una funcion objetivo combina cumplimiento duro y evaluacion semantica para seleccionar el mejor candidato.
+> El sistema usa un LLM mediante la API de Groq como componente generativo, reparador, juez de restricciones abiertas y evaluador semantico. El codigo determinista comprueba longitud, conceptos obligatorios y terminos prohibidos. Groq evalua como restricciones duras los aspectos linguisticos abiertos: saludo, cuerpo, cierre y agradecimiento final. La estrategia unificada genera una poblacion inicial de candidatos, selecciona el mejor mediante una funcion objetivo y, si no es valido, lo repara con retroalimentacion estructurada del verificador hasta alcanzar un tope configurable.

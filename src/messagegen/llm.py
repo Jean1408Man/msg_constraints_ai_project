@@ -11,9 +11,10 @@ from abc import ABC, abstractmethod
 from pathlib import Path
 
 from .models import MessageInstance
+from .utils import contains_concept, normalize, word_count
 
 
-PROMPT_VERSION = "balanced-hard-length-v5"
+PROMPT_VERSION = "constraint-first-prompts-v15"
 
 
 class BaseGenerator(ABC):
@@ -252,29 +253,127 @@ class GroqGenerator(BaseGenerator):
     @staticmethod
     def _system_prompt() -> str:
         return (
-            "Eres un generador de mensajes en español. "
-            "Debes cumplir primero las restricciones objetivas de longitud, conceptos obligatorios "
-            "y términos prohibidos. "
+            "Eres un generador de mensajes en español bajo restricciones verificadas automáticamente. "
+            "La validez depende primero de restricciones duras: longitud, conceptos obligatorios literales "
+            "y términos prohibidos. La naturalidad importa, pero nunca por encima de esas restricciones. "
             "Responde SOLO con el mensaje final, sin explicaciones, sin comillas, sin listas, "
             "sin markdown y sin decir que cumpliste las reglas. "
-            "Escribe mensajes claros, compactos, naturales y adecuados al destinatario."
+            "El mensaje debe sonar natural y tener saludo, cuerpo y cierre cuando se pidan."
         )
 
     @staticmethod
     def _target_words(instance: MessageInstance) -> int:
-        width = max(0, instance.max_words - instance.min_words)
-        # Un objetivo algo por debajo del centro reduce salidas apenas largas sin
-        # empujar los rangos estrechos por debajo del mínimo.
-        return min(instance.max_words, instance.min_words + max(2, round(width * 0.45)))
+        span = instance.max_words - instance.min_words
+        target = instance.min_words + round(span * 0.75)
+        return max(instance.min_words, min(instance.max_words - 1, target))
 
     @staticmethod
     def _sentence_plan(instance: MessageInstance) -> str:
         target = GroqGenerator._target_words(instance)
-        if target <= 42:
-            return "3 oraciones breves"
-        if target <= 58:
-            return "4 oraciones breves"
-        return "4 oraciones de longitud media"
+        sentence_count = 3 if instance.max_words <= 63 else 4
+        target_per_sentence = max(8, round(target / sentence_count))
+        max_per_sentence = max(8, instance.max_words // sentence_count)
+        low = max(8, min(max_per_sentence, target_per_sentence - 2))
+        high = max(low, min(max_per_sentence, target_per_sentence + 1))
+        return f"exactamente {sentence_count} oraciones desarrolladas de {low} a {high} palabras cada una"
+
+    @staticmethod
+    def _structure_rules(instance: MessageInstance) -> list[str]:
+        required = set(instance.required_structure)
+        rules: list[str] = []
+        if "saludo" in required:
+            rules.append(
+                "La primera oración debe comenzar con un saludo claro al destinatario, "
+                "por ejemplo 'Estimado cliente,' u 'Hola cliente,'."
+            )
+        if "cuerpo" in required:
+            rules.append(
+                "El cuerpo debe desarrollar una idea central con motivo, contexto, beneficio, petición "
+                "o siguiente paso; no uses frases sueltas sin desarrollo."
+            )
+        if "cierre" in required:
+            if instance.must_end_with_gratitude:
+                rules.append(
+                    "La última oración debe funcionar como cierre y expresar agradecimiento claro; "
+                    "no termines con una descripción o palabra de relleno."
+                )
+            else:
+                rules.append(
+                    "La última oración debe cerrar la interacción de forma inequívoca con una despedida, "
+                    "invitación, conclusión o siguiente paso; no termines con una descripción o palabra de relleno."
+                )
+        elif instance.must_end_with_gratitude:
+            rules.append("La última parte del mensaje debe expresar agradecimiento claro.")
+        return rules
+
+    @staticmethod
+    def _format_structure_rules(instance: MessageInstance) -> str:
+        rules = GroqGenerator._structure_rules(instance)
+        if not rules:
+            return "- No hay estructura abierta adicional."
+        return "\n".join(f"- {rule}" for rule in rules)
+
+    @staticmethod
+    def _length_repair_instruction(text: str, instance: MessageInstance) -> str:
+        current = word_count(text)
+        target = GroqGenerator._target_words(instance)
+        low, high = GroqGenerator._repair_word_window(text, instance)
+        if current < instance.min_words:
+            missing = instance.min_words - current
+            if missing <= 2:
+                return (
+                    f"El mensaje actual tiene {current} palabras y está CORTO por solo {missing}. "
+                    f"Conserva casi todo y agrega {missing + 1} palabra(s) útiles, sin añadir una frase completa. "
+                    f"Rango operativo para esta reparación: {low}-{high} palabras."
+                )
+            midpoint = (low + high) // 2
+            needed = max(missing, midpoint - current)
+            return (
+                f"El mensaje actual tiene {current} palabras y está CORTO. "
+                f"No basta con agregar {missing} palabra(s) al final: reescribe una versión completa "
+                f"con alrededor de {needed} palabras netas adicionales. "
+                f"Rango operativo para esta reparación: {low}-{high} palabras. "
+                "La reparación debe ser claramente más amplia, no un parche mínimo."
+            )
+        if current > instance.max_words:
+            extra = current - instance.max_words
+            return (
+                f"El mensaje actual tiene {current} palabras y está LARGO. "
+                f"Elimina al menos {extra} palabras secundarias y apunta a {target}. "
+                f"Rango operativo para esta reparación: {low}-{high} palabras. "
+                "Reescribe una versión más compacta; no agregues ideas nuevas ni amplíes el texto."
+            )
+        return (
+            f"El mensaje actual tiene {current} palabras, ya está dentro del rango. "
+            "Conserva la longitud aproximada mientras corriges los demás fallos."
+        )
+
+    @staticmethod
+    def _repair_word_window(text: str, instance: MessageInstance) -> tuple[int, int]:
+        current = word_count(text)
+        target = GroqGenerator._target_words(instance)
+        if current < instance.min_words:
+            missing = instance.min_words - current
+            if missing <= 2:
+                return instance.min_words, min(instance.max_words, instance.min_words + 3)
+            if missing <= 8:
+                return instance.min_words, min(instance.max_words, instance.min_words + 6)
+            return target, instance.max_words
+        if current > instance.max_words:
+            return instance.min_words, min(target, instance.max_words - 1)
+        return instance.min_words, instance.max_words
+
+    @staticmethod
+    def _literal_check_summary(text: str, instance: MessageInstance) -> str:
+        missing = [concept for concept in instance.required_concepts if not contains_concept(text, concept)]
+        nt = normalize(text)
+        found_forbidden = [term for term in instance.forbidden_terms if normalize(term) in nt]
+        missing_text = GroqGenerator._format_terms(missing) if missing else "ninguno"
+        forbidden_text = GroqGenerator._format_terms(found_forbidden) if found_forbidden else "ninguno"
+        return (
+            f"Conceptos obligatorios faltantes detectados: {missing_text}\n"
+            f"Términos prohibidos detectados: {forbidden_text}"
+        )
 
     @staticmethod
     def _format_terms(values: list[str]) -> str:
@@ -288,9 +387,9 @@ class GroqGenerator(BaseGenerator):
             f"Tipo de mensaje: {instance.message_type}\n"
             f"Destinatario: {instance.recipient}\n"
             f"Tono obligatorio: {instance.tone}\n"
-            f"Longitud: entre {instance.min_words} y {instance.max_words} palabras\n"
-            f"Objetivo recomendado: cerca de {GroqGenerator._target_words(instance)} palabras\n"
-            f"Forma recomendada: {GroqGenerator._sentence_plan(instance)}\n"
+            f"Longitud obligatoria: mínimo {instance.min_words}, máximo {instance.max_words} palabras\n"
+            f"Meta de longitud: {GroqGenerator._target_words(instance)} palabras\n"
+            f"Plan recomendado: {GroqGenerator._sentence_plan(instance)}\n"
             f"Conceptos obligatorios literales: {GroqGenerator._format_terms(instance.required_concepts)}\n"
             f"Términos prohibidos ausentes: {GroqGenerator._format_terms(instance.forbidden_terms)}\n"
             f"Estructura requerida: {instance.required_structure}\n"
@@ -303,56 +402,60 @@ class GroqGenerator(BaseGenerator):
             if attempt == 1
             else "Haz una versión alternativa, más natural y menos mecánica que las anteriores."
         )
-        gratitude_rule = (
-            "La última oración debe ser un agradecimiento claro."
-            if instance.must_end_with_gratitude
-            else "Cierra de forma adecuada."
-        )
         return (
             "Genera un único mensaje que cumpla exactamente estas restricciones:\n"
             f"{self._format_instance(instance)}\n\n"
-            "Reglas:\n"
+            "Reglas duras de validez:\n"
             f"- {variation}\n"
-            f"- Usa {self._sentence_plan(instance)} y evita frases largas.\n"
-            f"- Apunta a unas {self._target_words(instance)} palabras; nunca salgas del rango {instance.min_words}-{instance.max_words}.\n"
-            "- Si dudas, prefiere un mensaje más corto y directo antes que uno elaborado.\n"
+            f"- Escribe {self._sentence_plan(instance)}.\n"
+            f"- Cuenta mentalmente las palabras antes de responder y entrega entre {instance.min_words} "
+            f"y {instance.max_words}; apunta a {self._target_words(instance)} palabras.\n"
+            f"- Si el borrador mental queda con menos de {instance.min_words} palabras, agrega contexto útil antes de responder.\n"
+            f"- Si el borrador mental queda con más de {instance.max_words} palabras, recorta antes de responder.\n"
+            "- No respondas con oraciones telegráficas de 3 a 7 palabras; cada oración debe aportar información concreta.\n"
             "- Copia cada concepto obligatorio exactamente como aparece, con sus tildes si las tiene.\n"
-            "- No lo sustituyas por verbos, plurales, sinónimos ni fechas concretas.\n"
+            "- No sustituyas conceptos obligatorios por verbos, plurales, sinónimos ni fechas concretas.\n"
+            "- Usa cada concepto obligatorio dentro de una oración natural, no como lista aislada.\n"
+            "- Una aparición literal de cada concepto obligatorio basta; evita repetirlo en todas las oraciones.\n"
             "- Ejemplo: si el concepto es 'confirmación', debe aparecer 'confirmación', no solo 'confirmar' o 'confirme'.\n"
             "- No uses términos prohibidos, ni siquiera para decir que no los usarás.\n"
-            "- Evita repetir conceptos, elogios o justificaciones.\n"
             "- No uses la frase 'Debe considerarse'.\n"
             "- No menciones las reglas ni la cantidad de palabras.\n"
-            "- Si la estructura pide saludo, abre con una forma natural de dirigirte al destinatario.\n"
-            "- Si la estructura pide cuerpo, incluye desarrollo central suficiente y coherente.\n"
-            "- Si la estructura pide cierre, termina con una despedida, conclusión o cierre comunicativo natural.\n"
-            f"- {gratitude_rule}\n"
+            "\nReglas de estructura abierta:\n"
+            f"{self._format_structure_rules(instance)}\n\n"
+            "Checklist mental obligatorio antes de responder:\n"
+            f"- Longitud dentro de {instance.min_words}-{instance.max_words} palabras.\n"
+            f"- Conceptos literales presentes: {self._format_terms(instance.required_concepts)}.\n"
+            f"- Términos prohibidos ausentes: {self._format_terms(instance.forbidden_terms)}.\n"
+            "- Saludo, cuerpo, cierre y agradecimiento presentes cuando se pidan.\n"
             "- Responde únicamente con el mensaje final."
         )
 
     def _repair_prompt(self, text: str, instance: MessageInstance, feedback: list[str]) -> str:
         formatted_feedback = "\n".join(f"- {item}" for item in feedback) if feedback else "- Sin detalles."
+        low, high = self._repair_word_window(text, instance)
         return (
-            "Repara el siguiente mensaje para que cumpla todas las restricciones. "
-            "Conserva la intención y deja una versión compacta y natural.\n\n"
-            f"Restricciones:\n{self._format_instance(instance)}\n\n"
-            f"Mensaje actual:\n{text}\n\n"
-            f"Fallos detectados por el verificador:\n{formatted_feedback}\n\n"
-            "Instrucciones:\n"
-            "- Devuelve solo el mensaje reparado.\n"
-            f"- Usa {self._sentence_plan(instance)}.\n"
-            f"- Apunta a unas {self._target_words(instance)} palabras y respeta siempre el rango {instance.min_words}-{instance.max_words}.\n"
-            "- Si el mensaje es largo, recorta primero repeticiones, elogios genéricos, incisos y fórmulas extensas de cortesía.\n"
-            "- Si el mensaje es corto, añade solo una frase breve y útil.\n"
-            f"- Deben quedar visibles estos conceptos exactos: {self._format_terms(instance.required_concepts)}.\n"
-            "- Copia conceptos faltantes exactamente; no los cambies por verbos, plurales, sinónimos ni ejemplos.\n"
-            f"- Estos términos no pueden aparecer: {self._format_terms(instance.forbidden_terms)}.\n"
-            "- Si aparece un término prohibido, elimínalo o reemplázalo por otra idea que no contenga esa palabra.\n"
-            "- Si falla saludo, abre con una forma natural de dirigirte al destinatario.\n"
-            "- Si falla cuerpo, agrega desarrollo central claro y coherente.\n"
-            "- Si falla cierre, termina con una despedida, conclusión o cierre comunicativo natural.\n"
-            "- Si falla cierre_agradecimiento, haz que la última parte exprese agradecimiento claro.\n"
-            "- No uses listas ni explicaciones."
+            "Reescribe el mensaje actual para que sea VÁLIDO. Devuelve solo el mensaje final.\n\n"
+            "Restricciones duras:\n"
+            f"- Longitud final obligatoria: {instance.min_words}-{instance.max_words} palabras.\n"
+            f"- Rango operativo para esta reparación: {low}-{high} palabras.\n"
+            f"- Forma: {self._sentence_plan(instance)}.\n"
+            f"- Conceptos exactos que deben aparecer: {self._format_terms(instance.required_concepts)}.\n"
+            f"- Términos prohibidos que no pueden aparecer: {self._format_terms(instance.forbidden_terms)}.\n"
+            "- Los conceptos obligatorios deben aparecer literalmente; no sirven sinónimos, verbos, plurales ni fechas concretas.\n\n"
+            "Diagnóstico automático:\n"
+            f"- {self._length_repair_instruction(text, instance)}\n"
+            f"{self._literal_check_summary(text, instance)}\n"
+            f"{formatted_feedback}\n\n"
+            "Reglas de reescritura:\n"
+            "- No repitas el mensaje actual si ya fue inválido.\n"
+            "- Si está largo, elimina detalles secundarios y conserva solo saludo, propósito, conceptos obligatorios y cierre.\n"
+            "- Si está corto por 1 o 2 palabras, haz un ajuste mínimo y no añadas una frase completa.\n"
+            "- Si está corto por más de 2 palabras, agrega contexto útil dentro del rango operativo.\n"
+            "- Si falta un concepto, inserta esa palabra exacta en una oración natural.\n"
+            "- Si sobra un término prohibido, elimínalo por completo.\n"
+            f"{self._format_structure_rules(instance)}\n\n"
+            f"Mensaje actual:\n{text}"
         )
 
     @staticmethod
